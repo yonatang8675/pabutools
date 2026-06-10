@@ -46,6 +46,7 @@ def exact_equal_shares(
     instance: Instance,
     profile: AbstractApprovalProfile,
     utilities: dict[Project, Numeric] | None = None,
+    _approval_sets: dict[Project, set[int]] | None = None,
 ) -> BudgetAllocation:
     """
     Algorithm 1: EES for uniform utilities.
@@ -95,6 +96,24 @@ def exact_equal_shares(
 
     b = instance.budget_limit
 
+    # Precompute approval sets: project -> set of voter indices.
+    # This avoids 9M+ expensive project-in-ballot lookups via wrapper methods.
+    if _approval_sets is not None:
+        approval_sets = _approval_sets
+    else:
+        approval_sets = {}
+        for project in instance:
+            s = set()
+            for i in range(n):
+                if project in profile[i]:
+                    s.add(i)
+            approval_sets[project] = s
+
+    # Precompute frac(cost) for each project to avoid repeated conversions.
+    frac_costs = {}
+    for project in instance:
+        frac_costs[project] = frac(project.cost)
+
     # Line 1: Start with no selected projects and equal voter budgets.
     selected_projects = []
     payments = {}
@@ -126,16 +145,18 @@ def exact_equal_shares(
                 project_utility = 1
 
             # N_p: voters who approve project, preserving remaining-budget order.
+            project_approvers = approval_sets[project]
             supporters = []
             for i in voters_by_remaining_budget:
-                if project in profile[i]:
+                if i in project_approvers:
                     supporters.append(i)
             if not supporters:
                 continue
 
+            p_frac_cost = frac_costs[project]
             # Greedily remove the poorest voter while they can't afford
             # their equal share cost(p)/|V|.
-            while supporters and remaining_budgets[supporters[0]] < frac(project.cost) / len(supporters):
+            while supporters and remaining_budgets[supporters[0]] < p_frac_cost / len(supporters):
                 supporters.pop(0)
 
             if not supporters:
@@ -145,7 +166,7 @@ def exact_equal_shares(
             if project.cost == 0:
                 bang_per_buck = float('inf')
             else:
-                bang_per_buck = frac(len(supporters) * project_utility) / project.cost
+                bang_per_buck = frac(len(supporters) * project_utility) / p_frac_cost
             if bang_per_buck > best_score:
                 best_score = bang_per_buck
                 best_candidates = [(project, supporters)]
@@ -180,7 +201,7 @@ def exact_equal_shares(
 
         # Line 11: Charge each chosen supporter an equal share of the project cost.
         chosen_supporters_set = set(chosen_supporters)
-        payment = frac(chosen_project.cost) / len(chosen_supporters)
+        payment = frac_costs[chosen_project] / len(chosen_supporters)
         for i in chosen_supporters:
             payments[i][chosen_project] = payment
             remaining_budgets[i] -= payment
@@ -279,6 +300,7 @@ def greedy_project_change(
     leximax_payments: dict[int, list[tuple[Numeric, str]]],
     voters_by_leftover: list[int] | None = None,
     voters_by_leximax: list[int] | None = None,
+    approval_sets: dict[Project, set[int]] | None = None,
 ) -> Numeric:
     """
     Algorithm 2: GreedyProjectChange (GPC).
@@ -345,10 +367,13 @@ def greedy_project_change(
     n = len(profile)
 
     # All voters who approve project.
-    project_supporters = set()
-    for voter in range(n):
-        if project in profile[voter]:
-            project_supporters.add(voter)
+    if approval_sets is not None:
+        project_supporters = approval_sets[project]
+    else:
+        project_supporters = set()
+        for voter in range(n):
+            if project in profile[voter]:
+                project_supporters.add(voter)
 
     # voters who already pay for project in the current solution.
     allocation_details = current_solution.details
@@ -444,6 +469,7 @@ def add_opt(
     instance: Instance,
     profile: AbstractApprovalProfile,
     current_solution: BudgetAllocation,
+    approval_sets: dict[Project, set[int]] | None = None,
 ) -> Numeric:
     """
     Algorithm 3: add-opt.
@@ -508,7 +534,7 @@ def add_opt(
     for project in instance:
         # Line 5: Keep the smallest change found for any project.
         gpc_result = greedy_project_change(instance, profile, current_solution, project, leftover_budgets, leximax_payments,
-            voters_by_leftover, voters_by_leximax,)
+            voters_by_leftover, voters_by_leximax, approval_sets=approval_sets)
         d = min(d, gpc_result)
 
     # Line 7: Return the minimum change over all projects.
@@ -573,9 +599,20 @@ def ees_add_opt_completion(
     best_result = None
     best_result_cost = frac(-1)
 
+    # Precompute approval sets once: project -> set of voter indices.
+    # The approval relationship never changes across iterations.
+    n = len(profile)
+    approval_sets = {}
+    for project in projects:
+        s = set()
+        for i in range(n):
+            if project in profile[i]:
+                s.add(i)
+        approval_sets[project] = s
+
     while True:
         virtual_inst = Instance(projects, budget_limit=virtual_budget)
-        result = exact_equal_shares(virtual_inst, profile, utilities)
+        result = exact_equal_shares(virtual_inst, profile, utilities, _approval_sets=approval_sets)
 
         total_cost = 0
         for project in result:
@@ -586,7 +623,7 @@ def ees_add_opt_completion(
             best_result = result
             best_result_cost = total_cost
 
-        d = add_opt(virtual_inst, profile, result)
+        d = add_opt(virtual_inst, profile, result, approval_sets=approval_sets)
         if d == float('inf') or d <= 0:
             logger.debug("ees_add_opt_completion: stopping (d=%s)", d)
             break
@@ -595,7 +632,7 @@ def ees_add_opt_completion(
         logger.debug("ees_add_opt_completion: increasing virtual_budget to %s (d=%s)", virtual_budget, d)
 
     if best_result is None:
-        best_result = exact_equal_shares(instance, profile, utilities)
+        best_result = exact_equal_shares(instance, profile, utilities, _approval_sets=approval_sets)
     
     logger.info("ees_add_opt_completion: returning %d projects, total_cost=%s",
                 len(best_result), best_result_cost)
